@@ -11,7 +11,8 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Canadian Census by DA", layout="wide")
 
-RELEASE_BASE_URL = "https://github.com/augustapplause/python-project-v6/releases/download/v1"
+#RELEASE_BASE_URL = "https://github.com/augustapplause/python-project-v6/releases/download/v1"
+RELEASE_BASE_URL = "https://github.com/augustapplause/python-project-v1/releases/download/v1"
 
 PROVINCE_FILES = {
     "AB": "AB_da_census_13vars_30m.geojson",

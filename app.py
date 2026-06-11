@@ -1061,16 +1061,6 @@ def build_correlation_table(output_df: pd.DataFrame, original_cols: list[str]) -
     return sort_df
 
 
-def create_batch_excel_download(output_df: pd.DataFrame, correlation_df: pd.DataFrame) -> bytes:
-    excel_buffer = io.BytesIO()
-
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        output_df.to_excel(writer, sheet_name="Store_Catchments", index=False)
-        correlation_df.to_excel(writer, sheet_name="Correlations", index=False)
-
-    excel_buffer.seek(0)
-    return excel_buffer.getvalue()
-
 
 def make_map(catchment: dict, radius_km: float, height: int = 430):
     geo = catchment["geo"]
@@ -1588,7 +1578,7 @@ def show_batch_processor_view():
         "If `latitude` and/or `longitude` are blank, the app attempts to ArcGIS geocode the 'address' column. "
         "An optional `province` or `province_code` column can improve geocoding and speed up DA matching. "
         "Output will retain all columns and append census stats. "
-        "If extra numeric columns are included, the Excel output will also include a correlation tab."
+        "If extra numeric columns are included, a second correlation CSV will also be available."
     )
 
     uploaded_file = st.file_uploader(
@@ -1705,25 +1695,25 @@ def show_batch_processor_view():
 
         st.dataframe(output_df.head(50), use_container_width=True)
 
-        csv_bytes = output_df.to_csv(index=False).encode("utf-8-sig")
-        excel_bytes = create_batch_excel_download(output_df, correlation_df)
+        catchment_csv_bytes = output_df.to_csv(index=False).encode("utf-8-sig")
+        correlation_csv_bytes = correlation_df.to_csv(index=False).encode("utf-8-sig")
 
         download_col1, download_col2 = st.columns(2)
 
         with download_col1:
             st.download_button(
-                label="Download enriched CSV",
-                data=csv_bytes,
+                label="Download enriched catchment CSV",
+                data=catchment_csv_bytes,
                 file_name="batch_catchment_census_output.csv",
                 mime="text/csv",
             )
 
         with download_col2:
             st.download_button(
-                label="Download enriched Excel with correlations",
-                data=excel_bytes,
-                file_name="batch_catchment_census_output_with_correlations.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                label="Download correlation CSV",
+                data=correlation_csv_bytes,
+                file_name="batch_correlation_output.csv",
+                mime="text/csv",
             )
 
 

@@ -14,8 +14,8 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Canadian Census by DA", layout="wide")
 
-#RELEASE_BASE_URL = "https://github.com/augustapplause/python-project-v6/releases/download/v1"
-RELEASE_BASE_URL = "https://github.com/augustapplause/python-project-v1/releases/download/v1"
+RELEASE_BASE_URL = "https://github.com/augustapplause/python-project-v6/releases/download/v1"
+#RELEASE_BASE_URL = "https://github.com/augustapplause/python-project-v1/releases/download/v1"
 
 PROVINCE_FILES = {
     "AB": "AB_da_census_13vars_30m.geojson",
@@ -105,6 +105,12 @@ CORRELATION_CENSUS_COLUMNS = [
 ]
 
 CORRELATION_LOCATION_COLUMNS = {
+    "id",
+    "store_id",
+    "storeid",
+    "store_number",
+    "store_no",
+    "location_id",
     "latitude",
     "lat",
     "longitude",
@@ -511,13 +517,13 @@ def summarize_selected_for_batch(selected: gpd.GeoDataFrame) -> dict:
         "average_household_income": average_household_income,
         "median_household_income": median_household_income,
         "bachelors_degree_or_higher": bachelors_degree_or_higher,
-        "owner_pct": 0 if total_households == 0 else owner_households / total_households * 100,
-        "renter_pct": 0 if total_households == 0 else renter_households / total_households * 100,
-        "bachelor_pct": 0 if total_population == 0 else bachelors_degree_or_higher / total_population * 100,
-        "seniors_pct": 0 if total_population == 0 else population_65_plus / total_population * 100,
-        "population_0_39_pct": 0 if total_population == 0 else population_0_39 / total_population * 100,
-        "visible_minority_pct": 0 if total_population == 0 else visible_minority_population / total_population * 100,
-        "non_immigrant_pct": 0 if total_population == 0 else non_immigrants / total_population * 100,
+        "owner_pct": 0 if total_households == 0 else owner_households / total_households,
+        "renter_pct": 0 if total_households == 0 else renter_households / total_households,
+        "bachelor_pct": 0 if total_population == 0 else bachelors_degree_or_higher / total_population,
+        "seniors_pct": 0 if total_population == 0 else population_65_plus / total_population,
+        "population_0_39_pct": 0 if total_population == 0 else population_0_39 / total_population,
+        "visible_minority_pct": 0 if total_population == 0 else visible_minority_population / total_population,
+        "non_immigrant_pct": 0 if total_population == 0 else non_immigrants / total_population,
         "estimated_da_income": average_household_income * total_households,
         "land_area_sq_km": land_area_sq_km,
         "population_density": 0 if land_area_sq_km == 0 else total_population / land_area_sq_km,
@@ -978,6 +984,50 @@ def get_independent_variable_columns(output_df: pd.DataFrame, original_cols: lis
             independent_cols.append(col)
 
     return independent_cols
+
+
+
+def coerce_numeric_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep true numeric columns numeric before CSV export.
+    Convert only plain numeric-looking object columns.
+    Do not strip percent signs, dollar signs, commas, or alter scale.
+    """
+    cleaned = df.copy()
+
+    for col in cleaned.columns:
+        if pd.api.types.is_numeric_dtype(cleaned[col]):
+            continue
+
+        series_as_text = cleaned[col].astype(str).str.strip()
+        non_blank = series_as_text.ne("") & series_as_text.str.lower().ne("nan")
+
+        if non_blank.sum() == 0:
+            continue
+
+        # Only convert simple numeric strings. This avoids bad conversions such as
+        # changing percentage-like or formatted text values.
+        simple_numeric_mask = series_as_text[non_blank].str.fullmatch(
+            r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+        )
+
+        if simple_numeric_mask.all():
+            cleaned[col] = pd.to_numeric(series_as_text, errors="coerce")
+
+    return cleaned
+
+
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """
+    Export CSV with stable plain numeric formatting.
+    CSV cannot store cell types, but this gives Excel clean numeric-looking values.
+    """
+    return df.to_csv(
+        index=False,
+        na_rep="",
+        float_format="%.10g",
+        encoding="utf-8-sig",
+    ).encode("utf-8-sig")
 
 
 def build_correlation_table(output_df: pd.DataFrame, original_cols: list[str]) -> pd.DataFrame:
@@ -1683,9 +1733,17 @@ def show_batch_processor_view():
             original_cols=list(input_df.columns)
         )
 
+        # Force correlation numeric fields to remain numeric in the CSV output where values exist.
+        for numeric_col in ["pearson_correlation", "abs_correlation", "n"]:
+            if numeric_col in correlation_df.columns:
+                correlation_df[numeric_col] = pd.to_numeric(correlation_df[numeric_col], errors="coerce")
+
+        output_df_for_csv = coerce_numeric_for_csv(output_df)
+        correlation_df_for_csv = coerce_numeric_for_csv(correlation_df)
+
         st.session_state["batch_output_preview_df"] = output_df.head(50)
-        st.session_state["batch_catchment_csv_bytes"] = output_df.to_csv(index=False).encode("utf-8-sig")
-        st.session_state["batch_correlation_csv_bytes"] = correlation_df.to_csv(index=False).encode("utf-8-sig")
+        st.session_state["batch_catchment_csv_bytes"] = dataframe_to_csv_bytes(output_df_for_csv)
+        st.session_state["batch_correlation_csv_bytes"] = dataframe_to_csv_bytes(correlation_df_for_csv)
         st.session_state["batch_detected_independent_cols"] = detected_independent_cols
         st.session_state["batch_processing_complete"] = True
 

@@ -1,9 +1,12 @@
 import io
+import time
+import zipfile
 import requests
 import pandas as pd
 import geopandas as gpd
 import streamlit as st
 import folium
+import xml.etree.ElementTree as ET
 
 from geopy.geocoders import ArcGIS
 from shapely.geometry import Point
@@ -37,6 +40,40 @@ PROVINCE_NAMES = {
     "ON": "Ontario", "PE": "Prince Edward Island", "QC": "Quebec",
     "SK": "Saskatchewan", "YT": "Yukon",
 }
+
+BATCH_OUTPUT_COLUMNS = [
+    "processing_status",
+    "geocode_status",
+    "geocoded_address",
+    "matched_province",
+    "subject_da_id",
+    "da_count",
+    "total_population",
+    "population_0_19",
+    "population_20_39",
+    "population_40_64",
+    "population_65_plus",
+    "population_0_39",
+    "non_immigrants",
+    "visible_minority_population",
+    "total_households",
+    "owner_households",
+    "renter_households",
+    "average_household_income",
+    "median_household_income",
+    "bachelors_degree_or_higher",
+    "owner_pct",
+    "renter_pct",
+    "bachelor_pct",
+    "seniors_pct",
+    "population_0_39_pct",
+    "visible_minority_pct",
+    "non_immigrant_pct",
+    "estimated_da_income",
+    "land_area_sq_km",
+    "population_density",
+    "household_density",
+]
 
 DEFAULT_SINGLE_ADDRESS = "50 Victoria St, Gatineau, Quebec"
 DEFAULT_COMPARE_ADDRESS_A = "50 Victoria St, Gatineau, Quebec"
@@ -149,6 +186,35 @@ def geocode_address(address: str):
         "lon": location.longitude,
         "raw": location.raw,
     }
+
+
+def geocode_address_with_retry(address: str, max_retries: int = 3, delay_seconds: float = 1.25):
+    if not isinstance(address, str) or not address.strip():
+        return None, "missing_address"
+
+    geolocator = ArcGIS(timeout=20)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            location = geolocator.geocode(address)
+
+            if location is None:
+                return None, "geocode_no_match"
+
+            return {
+                "address": location.address,
+                "lat": location.latitude,
+                "lon": location.longitude,
+                "raw": location.raw,
+            }, "geocode_ok"
+
+        except Exception as exc:
+            if attempt == max_retries:
+                return None, f"geocode_error: {exc}"
+
+            time.sleep(delay_seconds * attempt)
+
+    return None, "geocode_error"
 
 
 def infer_province(address_text: str, geocode_result: dict) -> str | None:
@@ -293,6 +359,10 @@ def build_catchment(address: str, radius_km: float, min_overlap_pct: int):
     owner_households = selected["owner_households"].fillna(0).sum()
     bachelors_plus = selected["bachelors_degree_or_higher"].fillna(0).sum()
 
+    land_area_sq_km = selected["LANDAREA"].fillna(0).sum()
+    population_density = 0 if land_area_sq_km == 0 else total_population / land_area_sq_km
+    household_density = 0 if land_area_sq_km == 0 else total_households / land_area_sq_km
+
     metrics = {
         "da_count": len(selected),
         "total_population": total_population,
@@ -303,6 +373,9 @@ def build_catchment(address: str, radius_km: float, min_overlap_pct: int):
         "weighted_median_income": weighted_median_income,
         "weighted_average_household_income": weighted_average_household_income,
         "total_households": total_households,
+        "land_area_sq_km": land_area_sq_km,
+        "population_density": population_density,
+        "household_density": household_density,
         "owner_households": owner_households,
         "bachelors_plus": bachelors_plus,
         "seniors_pct": 0 if total_population == 0 else round(seniors_65 / total_population * 100),
@@ -323,6 +396,520 @@ def build_catchment(address: str, radius_km: float, min_overlap_pct: int):
         "subject_da_id": subject_da_id,
         "metrics": metrics,
     }
+
+
+
+def summarize_selected_for_batch(selected: gpd.GeoDataFrame) -> dict:
+    if selected is None or len(selected) == 0:
+        return {
+            "da_count": 0,
+            "total_population": 0,
+            "population_0_19": 0,
+            "population_20_39": 0,
+            "population_40_64": 0,
+            "population_65_plus": 0,
+            "population_0_39": 0,
+            "non_immigrants": 0,
+            "visible_minority_population": 0,
+            "total_households": 0,
+            "owner_households": 0,
+            "renter_households": 0,
+            "average_household_income": 0,
+            "median_household_income": 0,
+            "bachelors_degree_or_higher": 0,
+            "owner_pct": 0,
+            "renter_pct": 0,
+            "bachelor_pct": 0,
+            "seniors_pct": 0,
+            "population_0_39_pct": 0,
+            "visible_minority_pct": 0,
+            "non_immigrant_pct": 0,
+            "estimated_da_income": 0,
+            "land_area_sq_km": 0,
+            "population_density": 0,
+            "household_density": 0,
+        }
+
+    total_population = selected["total_population"].fillna(0).sum()
+    population_0_19 = selected["population_0_19"].fillna(0).sum()
+    population_20_39 = selected["population_20_39"].fillna(0).sum()
+    population_40_64 = selected["population_40_64"].fillna(0).sum()
+    population_65_plus = selected["population_65_plus"].fillna(0).sum()
+    population_0_39 = selected["population_0_39"].fillna(0).sum()
+    non_immigrants = selected["non_immigrants"].fillna(0).sum()
+    visible_minority_population = selected["visible_minority_population"].fillna(0).sum()
+    total_households = selected["total_households"].fillna(0).sum()
+    owner_households = selected["owner_households"].fillna(0).sum()
+    renter_households = selected["renter_households"].fillna(0).sum()
+    bachelors_degree_or_higher = selected["bachelors_degree_or_higher"].fillna(0).sum()
+    average_household_income = household_weighted_average_income(selected)
+    median_household_income = weighted_average_income(selected)
+    land_area_sq_km = selected["LANDAREA"].fillna(0).sum()
+
+    return {
+        "da_count": len(selected),
+        "total_population": total_population,
+        "population_0_19": population_0_19,
+        "population_20_39": population_20_39,
+        "population_40_64": population_40_64,
+        "population_65_plus": population_65_plus,
+        "population_0_39": population_0_39,
+        "non_immigrants": non_immigrants,
+        "visible_minority_population": visible_minority_population,
+        "total_households": total_households,
+        "owner_households": owner_households,
+        "renter_households": renter_households,
+        "average_household_income": average_household_income,
+        "median_household_income": median_household_income,
+        "bachelors_degree_or_higher": bachelors_degree_or_higher,
+        "owner_pct": 0 if total_households == 0 else owner_households / total_households * 100,
+        "renter_pct": 0 if total_households == 0 else renter_households / total_households * 100,
+        "bachelor_pct": 0 if total_population == 0 else bachelors_degree_or_higher / total_population * 100,
+        "seniors_pct": 0 if total_population == 0 else population_65_plus / total_population * 100,
+        "population_0_39_pct": 0 if total_population == 0 else population_0_39 / total_population * 100,
+        "visible_minority_pct": 0 if total_population == 0 else visible_minority_population / total_population * 100,
+        "non_immigrant_pct": 0 if total_population == 0 else non_immigrants / total_population * 100,
+        "estimated_da_income": average_household_income * total_households,
+        "land_area_sq_km": land_area_sq_km,
+        "population_density": 0 if land_area_sq_km == 0 else total_population / land_area_sq_km,
+        "household_density": 0 if land_area_sq_km == 0 else total_households / land_area_sq_km,
+    }
+
+
+def find_first_case_insensitive_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    normalized = {str(col).strip().lower(): col for col in df.columns}
+
+    for candidate in candidates:
+        if candidate.lower() in normalized:
+            return normalized[candidate.lower()]
+
+    return None
+
+
+def normalize_province_code(value) -> str | None:
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+
+    if text == "":
+        return None
+
+    province_name_lookup = {
+        "alberta": "AB",
+        "british columbia": "BC",
+        "manitoba": "MB",
+        "new brunswick": "NB",
+        "newfoundland and labrador": "NL",
+        "newfoundland": "NL",
+        "labrador": "NL",
+        "nova scotia": "NS",
+        "northwest territories": "NT",
+        "nunavut": "NU",
+        "ontario": "ON",
+        "prince edward island": "PE",
+        "pei": "PE",
+        "quebec": "QC",
+        "québec": "QC",
+        "saskatchewan": "SK",
+        "yukon": "YT",
+    }
+
+    upper_text = text.upper()
+
+    if upper_text in PROVINCE_FILES:
+        return upper_text
+
+    return province_name_lookup.get(text.lower())
+
+
+def append_province_to_address(address: str, province_value) -> str:
+    province_code = normalize_province_code(province_value)
+
+    if province_code is None:
+        return address
+
+    if not isinstance(address, str):
+        address = str(address)
+
+    address_text = address.strip()
+
+    if address_text == "":
+        return address_text
+
+    # Avoid duplicating province if user already included it.
+    lower_address = address_text.lower()
+    province_name = PROVINCE_NAMES.get(province_code, "").lower()
+
+    if province_code.lower() in lower_address or province_name in lower_address:
+        return address_text
+
+    return f"{address_text}, {province_code}, Canada"
+
+
+def excel_column_letters_to_index(cell_ref: str) -> int:
+    letters = "".join(ch for ch in cell_ref if ch.isalpha()).upper()
+    index = 0
+
+    for ch in letters:
+        index = index * 26 + (ord(ch) - ord("A") + 1)
+
+    return index - 1
+
+
+def read_xlsx_without_openpyxl(uploaded_file) -> pd.DataFrame:
+    """
+    Lightweight XLSX reader used when openpyxl is unavailable on Streamlit Cloud.
+    It reads the first worksheet and supports normal values, shared strings,
+    inline strings, numbers, blanks, and first-row headers.
+    """
+    uploaded_file.seek(0)
+    file_bytes = uploaded_file.read()
+
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+        ns = {
+            "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+            "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+        }
+
+        shared_strings = []
+
+        if "xl/sharedStrings.xml" in z.namelist():
+            shared_root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+
+            for si in shared_root.findall("main:si", ns):
+                parts = []
+
+                for t in si.findall(".//main:t", ns):
+                    parts.append(t.text or "")
+
+                shared_strings.append("".join(parts))
+
+        workbook_root = ET.fromstring(z.read("xl/workbook.xml"))
+        first_sheet = workbook_root.find("main:sheets/main:sheet", ns)
+
+        if first_sheet is None:
+            raise ValueError("No worksheets found in XLSX file.")
+
+        rel_id = first_sheet.attrib.get(
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        )
+
+        rels_root = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        sheet_target = None
+
+        for rel in rels_root.findall("rel:Relationship", ns):
+            if rel.attrib.get("Id") == rel_id:
+                sheet_target = rel.attrib.get("Target")
+                break
+
+        if sheet_target is None:
+            raise ValueError("Could not identify the first worksheet in the XLSX file.")
+
+        if sheet_target.startswith("/"):
+            sheet_path = sheet_target.lstrip("/")
+        else:
+            sheet_path = "xl/" + sheet_target
+
+        sheet_path = sheet_path.replace("xl/xl/", "xl/")
+
+        sheet_root = ET.fromstring(z.read(sheet_path))
+        rows = []
+
+        for row in sheet_root.findall(".//main:sheetData/main:row", ns):
+            values_by_col = {}
+            max_col = -1
+
+            for cell in row.findall("main:c", ns):
+                cell_ref = cell.attrib.get("r", "")
+                col_idx = excel_column_letters_to_index(cell_ref)
+                max_col = max(max_col, col_idx)
+
+                cell_type = cell.attrib.get("t")
+                value_node = cell.find("main:v", ns)
+                inline_node = cell.find("main:is/main:t", ns)
+
+                if cell_type == "s":
+                    if value_node is None or value_node.text is None:
+                        value = ""
+                    else:
+                        value = shared_strings[int(value_node.text)]
+                elif cell_type == "inlineStr":
+                    value = "" if inline_node is None or inline_node.text is None else inline_node.text
+                else:
+                    value = "" if value_node is None or value_node.text is None else value_node.text
+
+                values_by_col[col_idx] = value
+
+            if max_col >= 0:
+                rows.append([values_by_col.get(i, "") for i in range(max_col + 1)])
+
+        if len(rows) == 0:
+            return pd.DataFrame()
+
+        max_len = max(len(row) for row in rows)
+        normalized_rows = [row + [""] * (max_len - len(row)) for row in rows]
+
+        headers = [str(value).strip() for value in normalized_rows[0]]
+        data_rows = normalized_rows[1:]
+
+        # Handle duplicate or blank headers safely.
+        cleaned_headers = []
+        seen = {}
+
+        for i, header in enumerate(headers):
+            if header == "":
+                header = f"Unnamed_{i + 1}"
+
+            if header in seen:
+                seen[header] += 1
+                header = f"{header}_{seen[header]}"
+            else:
+                seen[header] = 0
+
+            cleaned_headers.append(header)
+
+        df = pd.DataFrame(data_rows, columns=cleaned_headers)
+
+        # Convert numeric-looking columns where possible.
+        # Avoid pandas errors="ignore" because some Streamlit environments reject it.
+        for col in df.columns:
+            converted = pd.to_numeric(df[col], errors="coerce")
+
+            # Only replace the column if conversion did not wipe out real text values.
+            non_blank_original = df[col].astype(str).str.strip().ne("")
+            converted_non_null = converted.notna()
+
+            if non_blank_original.sum() == 0:
+                df[col] = converted
+            elif converted_non_null.sum() == non_blank_original.sum():
+                df[col] = converted
+
+        return df
+
+
+def read_uploaded_table(uploaded_file) -> pd.DataFrame:
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+
+    if filename.endswith(".xlsx"):
+        try:
+            uploaded_file.seek(0)
+            return pd.read_excel(uploaded_file, engine="openpyxl")
+        except ImportError:
+            return read_xlsx_without_openpyxl(uploaded_file)
+
+    if filename.endswith(".xls"):
+        try:
+            uploaded_file.seek(0)
+            return pd.read_excel(uploaded_file)
+        except ImportError as exc:
+            raise ValueError(
+                "Old .xls files require the xlrd package on Streamlit Cloud. "
+                "Please save the file as .xlsx or .csv, or add xlrd to requirements.txt."
+            ) from exc
+
+    raise ValueError("Upload must be a CSV, XLS, or XLSX file.")
+
+
+@st.cache_data(show_spinner=False)
+def load_all_provinces_for_batch(release_base_url: str) -> dict:
+    return {
+        province_code: load_province_geojson(province_code, release_base_url)
+        for province_code in PROVINCE_FILES
+    }
+
+
+def build_catchment_from_lat_lon(
+    lat: float,
+    lon: float,
+    radius_km: float,
+    min_overlap_pct: int,
+    province_gdfs: dict,
+    preferred_province_code: str | None = None,
+):
+    point_wgs84, point_3347, buffer_3347 = make_buffer(lat, lon, radius_km)
+
+    if preferred_province_code in province_gdfs:
+        province_items = [(preferred_province_code, province_gdfs[preferred_province_code])]
+    else:
+        province_items = list(province_gdfs.items())
+
+    for province_code, da_gdf in province_items:
+        point_match = da_gdf[da_gdf.geometry.contains(point_wgs84)]
+
+        if len(point_match) == 0:
+            continue
+
+        da_3347 = da_gdf.to_crs(epsg=3347).copy()
+        subject_da = da_3347[da_3347.geometry.contains(point_3347)].copy()
+        subject_da_id = None
+
+        if len(subject_da) > 0:
+            subject_da_id = str(subject_da.iloc[0]["DA_ID"])
+
+        intersects_mask = da_3347.geometry.intersects(buffer_3347)
+        candidate_3347 = da_3347[intersects_mask].copy()
+
+        if len(candidate_3347) > 0:
+            candidate_3347["intersection_area"] = candidate_3347.geometry.intersection(buffer_3347).area
+            candidate_3347["da_area"] = candidate_3347.geometry.area
+            candidate_3347["overlap_pct"] = candidate_3347["intersection_area"] / candidate_3347["da_area"] * 100
+
+            selected_3347 = candidate_3347[
+                (candidate_3347["overlap_pct"] >= min_overlap_pct)
+                | (candidate_3347["DA_ID"].astype(str) == subject_da_id)
+            ].copy()
+        else:
+            selected_3347 = candidate_3347.copy()
+
+        selected = selected_3347.to_crs(epsg=4326)
+
+        return {
+            "error": None,
+            "province_code": province_code,
+            "subject_da_id": subject_da_id,
+            "selected": selected,
+        }
+
+    return {
+        "error": "no_da_match",
+        "province_code": None,
+        "subject_da_id": None,
+        "selected": gpd.GeoDataFrame(),
+    }
+
+
+def process_batch_file(
+    input_df: pd.DataFrame,
+    radius_km: float,
+    min_overlap_pct: int,
+    geocode_delay_seconds: float,
+    geocode_max_retries: int,
+):
+    df = input_df.copy()
+
+    lat_col = find_first_case_insensitive_column(df, ["latitude", "lat"])
+    lon_col = find_first_case_insensitive_column(df, ["longitude", "lon", "long"])
+
+    if lat_col is None:
+        df["latitude"] = pd.NA
+        lat_col = "latitude"
+
+    if lon_col is None:
+        df["longitude"] = pd.NA
+        lon_col = "longitude"
+
+    address_col = find_first_case_insensitive_column(
+        df,
+        ["address", "store_address", "full_address", "location_address", "addr"]
+    )
+
+    province_col = find_first_case_insensitive_column(
+        df,
+        ["province", "province_code", "prov", "pr", "state"]
+    )
+
+    province_gdfs = load_all_provinces_for_batch(RELEASE_BASE_URL)
+
+    output_rows = []
+    total_rows = len(df)
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for row_number, (_, row) in enumerate(df.iterrows(), start=1):
+        status_text.write(f"Processing row {row_number:,} of {total_rows:,}")
+
+        output_row = row.to_dict()
+        output_row.setdefault("processing_status", "ok")
+        output_row.setdefault("geocode_status", "not_needed")
+        output_row.setdefault("geocoded_address", "")
+        output_row.setdefault("matched_province", "")
+        output_row.setdefault("subject_da_id", "")
+
+        lat = pd.to_numeric(row.get(lat_col), errors="coerce")
+        lon = pd.to_numeric(row.get(lon_col), errors="coerce")
+        preferred_province_code = normalize_province_code(row.get(province_col)) if province_col is not None else None
+
+        try:
+            if pd.isna(lat) or pd.isna(lon):
+                if address_col is None:
+                    output_row["processing_status"] = "missing_lat_lon_no_address"
+                    output_row.update(summarize_selected_for_batch(gpd.GeoDataFrame()))
+                    output_rows.append(output_row)
+                    progress_bar.progress(row_number / total_rows)
+                    continue
+
+                address_for_geocoding = append_province_to_address(
+                    str(row.get(address_col, "")),
+                    row.get(province_col) if province_col is not None else None
+                )
+
+                geo, geocode_status = geocode_address_with_retry(
+                    address_for_geocoding,
+                    max_retries=geocode_max_retries,
+                    delay_seconds=geocode_delay_seconds,
+                )
+
+                output_row["geocode_status"] = geocode_status
+
+                if geo is None:
+                    output_row["processing_status"] = "geocode_failed"
+                    output_row.update(summarize_selected_for_batch(gpd.GeoDataFrame()))
+                    output_rows.append(output_row)
+                    progress_bar.progress(row_number / total_rows)
+                    time.sleep(geocode_delay_seconds)
+                    continue
+
+                lat = geo["lat"]
+                lon = geo["lon"]
+                output_row[lat_col] = lat
+                output_row[lon_col] = lon
+                output_row["geocoded_address"] = geo["address"]
+
+                time.sleep(geocode_delay_seconds)
+
+            catchment = build_catchment_from_lat_lon(
+                lat=float(lat),
+                lon=float(lon),
+                radius_km=radius_km,
+                min_overlap_pct=min_overlap_pct,
+                province_gdfs=province_gdfs,
+                preferred_province_code=preferred_province_code,
+            )
+
+            if catchment["error"] is not None:
+                output_row["processing_status"] = catchment["error"]
+                output_row.update(summarize_selected_for_batch(gpd.GeoDataFrame()))
+            else:
+                output_row["processing_status"] = "ok"
+                output_row["matched_province"] = catchment["province_code"]
+                output_row["subject_da_id"] = catchment["subject_da_id"]
+                output_row.update(summarize_selected_for_batch(catchment["selected"]))
+
+        except Exception as exc:
+            output_row["processing_status"] = f"error: {exc}"
+            output_row.update(summarize_selected_for_batch(gpd.GeoDataFrame()))
+
+        output_rows.append(output_row)
+        progress_bar.progress(row_number / total_rows)
+
+    progress_bar.empty()
+    status_text.empty()
+
+    output_df = pd.DataFrame(output_rows)
+
+    original_cols = list(input_df.columns)
+    appended_cols = [col for col in BATCH_OUTPUT_COLUMNS if col in output_df.columns]
+    remaining_cols = [
+        col for col in output_df.columns
+        if col not in original_cols + appended_cols
+    ]
+
+    return output_df[original_cols + remaining_cols + appended_cols]
 
 
 def make_map(catchment: dict, radius_km: float, height: int = 430):
@@ -446,6 +1033,8 @@ def show_single_address_view():
     weighted_median_income = metrics["weighted_median_income"]
     weighted_average_household_income = metrics["weighted_average_household_income"]
     total_households = metrics["total_households"]
+    population_density = metrics["population_density"]
+    household_density = metrics["household_density"]
     owner_households = metrics["owner_households"]
     bachelors_plus = metrics["bachelors_plus"]
     seniors_pct = metrics["seniors_pct"]
@@ -497,6 +1086,18 @@ def show_single_address_view():
     st.sidebar.markdown("#### Households")
     st.sidebar.markdown(
         f"<div style='font-size:28px;font-weight:bold;margin-top:-22px;'>{total_households:,.0f}<span style='font-size:20px;color:#CC0000;'>&nbsp;&nbsp;({owner_pct}% owned)</span></div>",
+        unsafe_allow_html=True
+    )
+
+    st.sidebar.markdown("#### Population Density")
+    st.sidebar.markdown(
+        f"<div style='font-size:28px;font-weight:bold;margin-top:-22px;'>{population_density:,.0f}<span style='font-size:20px;color:#CC0000;'>&nbsp;&nbsp;/ sq km</span></div>",
+        unsafe_allow_html=True
+    )
+
+    st.sidebar.markdown("#### Household Density")
+    st.sidebar.markdown(
+        f"<div style='font-size:28px;font-weight:bold;margin-top:-22px;'>{household_density:,.0f}<span style='font-size:20px;color:#CC0000;'>&nbsp;&nbsp;/ sq km</span></div>",
         unsafe_allow_html=True
     )
 
@@ -583,7 +1184,8 @@ def show_single_address_view():
 
         def highlight_total_row(row):
             if str(row["DA Code"]) == "TOTAL":
-                return ["background-color: #FFF2CC; font-weight: bold"] * len(row)
+                #return ["background-color: #003366; color: white; font-weight: bold"] * len(row)
+                return ["background-color: #2F5FD0; color: white; font-weight: bold"] * len(row)
             return [""] * len(row)
 
         styled_table = (
@@ -620,6 +1222,8 @@ def comparison_value(metric_name: str, value):
         return f"${value:,.0f}"
     if metric_name == "Estimated DA Income":
         return f"${value / 1_000_000:,.1f}M"
+    if metric_name in ["Population Density", "Household Density"]:
+        return f"{value:,.0f} / sq km"
     return f"{value:,.0f}"
 
 
@@ -633,6 +1237,10 @@ def comparison_difference(metric_name: str, a, b):
     if metric_name == "Estimated DA Income":
         sign = "+" if diff >= 0 else "-"
         return f"{sign}${abs(diff) / 1_000_000:,.1f}M"
+
+    if metric_name in ["Population Density", "Household Density"]:
+        sign = "+" if diff >= 0 else "-"
+        return f"{sign}{abs(diff):,.0f} / sq km"
 
     sign = "+" if diff >= 0 else ""
     return f"{sign}{diff:,.0f}"
@@ -759,6 +1367,18 @@ def show_comparison_view():
             "Difference": comparison_difference("Number of Households", metrics_a["total_households"], metrics_b["total_households"]),
         },
         {
+            "Metric": "Population Density",
+            "Address A": comparison_value("Population Density", metrics_a["population_density"]),
+            "Address B": comparison_value("Population Density", metrics_b["population_density"]),
+            "Difference": comparison_difference("Population Density", metrics_a["population_density"], metrics_b["population_density"]),
+        },
+        {
+            "Metric": "Household Density",
+            "Address A": comparison_value("Household Density", metrics_a["household_density"]),
+            "Address B": comparison_value("Household Density", metrics_b["household_density"]),
+            "Difference": comparison_difference("Household Density", metrics_a["household_density"], metrics_b["household_density"]),
+        },
+        {
             "Metric": "Avg Household Income",
             "Address A": comparison_value("Avg Household Income", metrics_a["weighted_average_household_income"]),
             "Address B": comparison_value("Avg Household Income", metrics_b["weighted_average_household_income"]),
@@ -800,13 +1420,133 @@ def show_comparison_view():
         make_map(catchment_b, radius_km, height=360)
 
 
+def show_batch_processor_view():
+    st.title("Batch CSV or XLS for census statistics")
+
+    st.markdown(
+        "Upload a CSV, XLS, or XLSX file. First row must be headers (minimum 'latitude', 'longitude', or 'address'). "
+        "If `latitude` and/or `longitude` are blank, the app attempts to ArcGIS geocode the 'address' column. "
+        "An optional `province` or `province_code` column can improve geocoding and speed up DA matching. "
+        "Output CSV will retain all columns and append census stats."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload address file",
+        type=["csv", "xls", "xlsx"]
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        radius_km = st.number_input(
+            "Radius (km)",
+            min_value=0.5,
+            max_value=10.0,
+            value=1.0,
+            step=0.5
+        )
+
+    with col2:
+        min_overlap_pct = st.number_input(
+            "Min DA overlap %",
+            min_value=0,
+            max_value=50,
+            value=5,
+            step=1
+        )
+
+    with col3:
+        geocode_delay_seconds = st.number_input(
+            "Geocode wait seconds",
+            min_value=0.25,
+            max_value=10.0,
+            value=1.25,
+            step=0.25
+        )
+
+    with col4:
+        geocode_max_retries = st.number_input(
+            "Geocode retries",
+            min_value=1,
+            max_value=5,
+            value=3,
+            step=1
+        )
+
+    if uploaded_file is None:
+        st.info("Upload a CSV, XLS, or XLSX file to begin.")
+        return
+
+    try:
+        input_df = read_uploaded_table(uploaded_file)
+    except Exception as exc:
+        st.error(f"Could not read uploaded file: {exc}")
+        return
+
+    st.write(f"Rows detected: {len(input_df):,}")
+    st.write("Columns detected:")
+    st.write(list(input_df.columns))
+
+    lat_col = find_first_case_insensitive_column(input_df, ["latitude", "lat"])
+    lon_col = find_first_case_insensitive_column(input_df, ["longitude", "lon", "long"])
+    address_col = find_first_case_insensitive_column(
+        input_df,
+        ["address", "store_address", "full_address", "location_address", "addr"]
+    )
+
+    province_col = find_first_case_insensitive_column(
+        input_df,
+        ["province", "province_code", "prov", "pr", "state"]
+    )
+
+    if province_col is not None:
+        st.info(f"Using province column `{province_col}` when available.")
+
+    if lat_col is None or lon_col is None:
+        if address_col is None:
+            st.warning(
+                "Latitude/longitude columns were not found, and no address column was found. "
+                "Rows without coordinates cannot be geocoded."
+            )
+        else:
+            st.info(
+                f"Latitude/longitude not fully found. Missing coordinates will be geocoded using `{address_col}`."
+            )
+    else:
+        st.success(f"Using latitude column `{lat_col}` and longitude column `{lon_col}`.")
+
+    if st.button("Process uploaded file"):
+        with st.spinner("Processing batch file..."):
+            output_df = process_batch_file(
+                input_df=input_df,
+                radius_km=float(radius_km),
+                min_overlap_pct=int(min_overlap_pct),
+                geocode_delay_seconds=float(geocode_delay_seconds),
+                geocode_max_retries=int(geocode_max_retries),
+            )
+
+        st.success("Batch processing complete.")
+        st.dataframe(output_df.head(50), use_container_width=True)
+
+        csv_bytes = output_df.to_csv(index=False).encode("utf-8-sig")
+
+        st.download_button(
+            label="Download enriched CSV",
+            data=csv_bytes,
+            file_name="batch_catchment_census_output.csv",
+            mime="text/csv",
+        )
+
+
 view_mode = st.radio(
     "View",
-    ["Single Address", "Compare Two Addresses"],
+    ["Single Address", "Compare Two Addresses", "Batch CSV or XLS"],
     horizontal=True
 )
 
 if view_mode == "Single Address":
     show_single_address_view()
-else:
+elif view_mode == "Compare Two Addresses":
     show_comparison_view()
+else:
+    show_batch_processor_view()
